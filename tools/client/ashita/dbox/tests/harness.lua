@@ -99,7 +99,18 @@ local function reply(command, boxno, slot, result, param1, param2, param3, item,
     server.replies[#server.replies + 1] = { id = 0x04B, size = size, data = table.concat(out) };
 end
 
+local handlers_ref;  -- set after the addon registers its callbacks
+
+-- Mirrors the packet back through the addon's packet_out callback, as Ashita would.
+local function echo_packet_out(id, packet)
+    if (handlers_ref == nil or handlers_ref['packet_out'] == nil) then return; end
+    local chars = {};
+    for i = 1, 0x20 do chars[#chars + 1] = string.char(packet[i] or 0); end
+    handlers_ref['packet_out']({ id = id, size = 0x20, data = table.concat(chars), injected = true });
+end
+
 local function handle(id, packet)
+    echo_packet_out(id, packet);
     -- packet is a 1-based byte table of the full 0x20 byte packet
     local command    = packet[0x05];
     local boxno      = packet[0x06] > 127 and packet[0x06] - 256 or packet[0x06];
@@ -130,7 +141,7 @@ local function handle(id, packet)
         server.opened = nil; server.container = {};
         reply(0x0F, -1, -1, 1);
     elseif (command == 0x01) then       -- Work
-        assert(server.opened ~= nil, 'Work with no box open');
+        if (server.opened == nil) then return; end  -- IsAnyDeliveryBoxOpen fails: logged and dropped
         assert(boxno == 1 or boxno == 2, 'Work BoxNo out of range');
         assert(itemWorkNo == -1, 'Work ItemWorkNo must be -1');
         server.container = {};
@@ -148,7 +159,7 @@ local function handle(id, packet)
         reply(0x05, boxno, -1, 2, nil, (boxno == 1) and 0xFF or nil, (boxno == 2) and 0xFF or nil);
         reply(0x05, boxno, -1, 1, nil, (boxno == 1) and waiting or nil, (boxno == 2) and waiting or nil);
     elseif (command == 0x0A) then       -- Get
-        assert(server.opened ~= nil, 'Get with no box open');
+        if (server.opened == nil) then return; end  -- IsAnyDeliveryBoxOpen fails: logged and dropped
         assert(boxno == 1 or boxno == 2, 'Get BoxNo out of range');
         assert(postWorkNo >= 0 and postWorkNo <= 8, 'Get PostWorkNo out of range');
         local item = server.container[postWorkNo];
@@ -160,7 +171,7 @@ local function handle(id, packet)
     elseif (command == 0x06) then       -- Recv
         assert(boxno == 1, 'Recv BoxNo must be Incoming');
         assert(itemWorkNo == 1, 'Recv ItemWorkNo must be 1');
-        assert(server.opened == 1, 'Recv without the incoming box open');
+        if (server.opened ~= 1) then return; end    -- IsRecvBoxOpen fails: logged and dropped
         if (server.container[postWorkNo] ~= nil) then return; end
         local item = table.remove(server.boxes[1].queue, 1);
         if (item == nil) then return; end
@@ -228,6 +239,8 @@ end
 
 local here = (arg and arg[0] and arg[0]:match('^(.*)[/\\][^/\\]*$')) or '.';
 dofile(here .. '/../dbox.lua');
+
+handlers_ref = handlers;
 
 local function pump()
     while (#server.replies > 0) do

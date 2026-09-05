@@ -19,12 +19,18 @@
 *   /dbox all [in|out]          Take every item currently held in the 8 cells of the given box.
 *   /dbox list [in|out]         Print the contents of the given box.
 *   /dbox new                   Pull waiting deliveries into the free cells of the incoming box.
+*   /dbox work [in|out]         Send Work, loading that box's cells server side.
+*   /dbox open <in|out>         Send PostOpen or DeliOpen by hand.
 *   /dbox close                 Send PostClose, closing the box server side.
 *   /dbox mode [queue|inject]   Show or change how packets are sent.
+*   /dbox debug [on|off]        Print every 0x04D sent and every 0x04B received.
 *   /dbox help                  Print the command list.
 *
-* Read the README next to this file before using it. In short: stand at a delivery NPC with the
-* delivery box window open, then use the commands.
+* The commands send their packets straight out. Nothing is opened or realigned first, so the
+* server answers out of whatever box it currently has loaded for the character. Note that the
+* server only answers Get for cells sitting in its container, and Work is what puts them there,
+* so a bare Get works when the game has already displayed that box. Otherwise drive it yourself:
+* /dbox open in, /dbox work in, /dbox get 1 in.
 --]]
 
 addon.name    = 'dbox';
@@ -60,6 +66,9 @@ local config = T{
 
     -- Seconds to pause between packets while working through multiple slots.
     step_delay = 0.15,
+
+    -- Print every 0x04D leaving the client and every 0x04B arriving. /dbox debug toggles it.
+    debug = false,
 };
 
 -- Packet ids.
@@ -92,6 +101,12 @@ local BOXNO = T{
     Outgoing = 2,
 };
 
+-- Reverse lookup, for the debug output.
+local COMMAND_NAME = {};
+for name, value in pairs(COMMAND) do
+    COMMAND_NAME[value] = name;
+end
+
 -- Number of cells the client and server keep open per box.
 local CELL_COUNT = 8;
 
@@ -103,7 +118,6 @@ local GIL_ITEM_ID = 65535;
 --]]
 local state = T{
     busy = false,
-    open = nil,  -- Box the server currently has open for us, tracked from replies.
     log  = T{},
 };
 
@@ -172,6 +186,29 @@ local function read_string(data, offset, length)
         text = text:sub(1, stop - 1);
     end
     return text;
+end
+
+-- Decodes the shared 0x04D / 0x04B field block for the debug output.
+local function describe_pbx(data)
+    local command = read_u8(data, 0x04);
+    return fmt('%s (0x%02X) BoxNo=%d PostWorkNo=%d ItemWorkNo=%d Result=0x%02X Res1=%d Res2=%d Res3=%d',
+        COMMAND_NAME[command] or 'unknown',
+        command,
+        read_i8(data, 0x05),
+        read_i8(data, 0x06),
+        read_i8(data, 0x07),
+        read_u8(data, 0x0C),
+        read_i8(data, 0x0D),
+        read_i8(data, 0x0E),
+        read_i8(data, 0x0F));
+end
+
+local function hex_dump(data, count)
+    local parts = {};
+    for offset = 0, math.min(count, #data) - 1 do
+        parts[#parts + 1] = fmt('%02X', read_u8(data, offset));
+    end
+    return table.concat(parts, ' ');
 end
 
 -- Item name for display; the resource name arrays are language indexed.
@@ -339,18 +376,24 @@ ashita.events.register('packet_in', 'dbox_packet_in', function (e)
         reply.stack  = read_u32(e.data, 0x38);
     end
 
-    -- Track which box the server has open for us, including boxes opened by the game itself.
-    if (reply.command == COMMAND.PostOpen and reply.result == 0x01) then
-        state.open = BOXNO.Incoming;
-    elseif (reply.command == COMMAND.DeliOpen and reply.result == 0x01) then
-        state.open = BOXNO.Outgoing;
-    elseif (reply.command == COMMAND.PostClose) then
-        state.open = nil;
+    if (config.debug) then
+        msg(fmt('in  0x04B size=%d %s', e.size, describe_pbx(e.data)));
     end
 
     if (state.busy) then
         state.log[#state.log + 1] = reply;
     end
+end);
+
+-- Debug only: confirms the packet actually left the client, and with what bytes.
+ashita.events.register('packet_out', 'dbox_packet_out', function (e)
+    if (not config.debug or e.id ~= PBX_C2S) then
+        return;
+    end
+
+    msg(fmt('out 0x04D size=%d injected=%s', e.size, tostring(e.injected)));
+    msg('    ' .. describe_pbx(e.data));
+    msg('    ' .. hex_dump(e.data, 16));
 end);
 
 local function log_mark()
@@ -378,12 +421,9 @@ end
 * Box operations.
 --]]
 
--- Puts the server into the requested box mode. Skipped when it is already there.
+-- Sends PostOpen or DeliOpen, only when asked for explicitly. Nothing else calls this: the
+-- commands below send their packets straight out and leave the box mode alone.
 local function open_box(box)
-    if (state.open == box) then
-        return true;
-    end
-
     local command = (box == BOXNO.Incoming) and COMMAND.PostOpen or COMMAND.DeliOpen;
     local mark    = log_mark();
 
@@ -391,7 +431,7 @@ local function open_box(box)
 
     local reply = wait_reply(mark, command);
     if (reply == nil) then
-        err(fmt('No reply when opening the %s box. Is the delivery box window open?', box_name(box)));
+        err(fmt('No reply opening the %s box. Turn on /dbox debug and check the map log.', box_name(box)));
         return false;
     end
     if (reply.result ~= 0x01) then
@@ -399,6 +439,7 @@ local function open_box(box)
         return false;
     end
 
+    ok(fmt('Opened the %s box.', box_name(box)));
     return true;
 end
 
@@ -430,7 +471,8 @@ local function read_cells(box)
     end
 
     if (seen == 0) then
-        err(fmt('No reply when reading the %s box.', box_name(box)));
+        err(fmt('No reply reading the %s box. The box may not be open server side; try /dbox open %s.',
+            box_name(box), (box == BOXNO.Incoming) and 'in' or 'out'));
         return nil;
     end
 
@@ -460,7 +502,8 @@ local function waiting_count(box)
     return nil;
 end
 
--- Takes the item in one cell. Returns true when the item reached the inventory.
+-- Sends Get for one cell. cell is optional; the reply carries ItemNo and Stack either way.
+-- Returns true when the item reached the inventory.
 local function take_cell(box, postWorkNo, cell)
     local mark = log_mark();
 
@@ -468,7 +511,10 @@ local function take_cell(box, postWorkNo, cell)
 
     local reply = wait_reply(mark, COMMAND.Get, box);
     if (reply == nil) then
-        err(fmt('No reply taking slot %d. The cell may already be empty.', to_slot_label(postWorkNo)));
+        err(fmt('No reply taking %s slot %d. The server answers Get only for cells it has loaded:',
+            box_name(box), to_slot_label(postWorkNo)));
+        err(fmt('  the cell is empty, or nothing has loaded that box yet. /dbox work %s loads it.',
+            (box == BOXNO.Incoming) and 'in' or 'out'));
         return false;
     end
     if (reply.result ~= 0x01) then
@@ -476,7 +522,10 @@ local function take_cell(box, postWorkNo, cell)
         return false;
     end
 
-    ok(fmt('Slot %d: %s x%d', to_slot_label(postWorkNo), item_name(cell.itemid), cell.stack));
+    local itemid = (reply.itemid ~= 0) and reply.itemid or (cell and cell.itemid or 0);
+    local stack  = (reply.itemid ~= 0) and reply.stack or (cell and cell.stack or 0);
+
+    ok(fmt('Slot %d: %s x%d', to_slot_label(postWorkNo), item_name(itemid), stack));
     return true;
 end
 
@@ -491,16 +540,35 @@ local function print_help()
     msg('  /dbox all [in|out]         Take everything currently in the 8 cells.');
     msg('  /dbox list [in|out]        Print the contents of a box.');
     msg('  /dbox new                  Pull waiting deliveries into free incoming cells.');
+    msg('  /dbox work [in|out]        Send Work, loading that box\'s cells server side.');
+    msg('  /dbox open <in|out>        Send PostOpen or DeliOpen, if you want it explicitly.');
     msg('  /dbox close                Close the box server side.');
     msg('  /dbox mode [queue|inject]  Show or change how packets are sent.');
-    msg(fmt('Slots are numbered from %d. Stand at a delivery NPC with the box window open.', config.slot_base));
+    msg('  /dbox debug [on|off]       Print every 0x04D sent and every 0x04B received.');
+    msg(fmt('Slots are numbered from %d. get sends nothing but the Get packet itself.', config.slot_base));
 end
 
-local function command_list(box)
-    if (not open_box(box)) then
+-- One packet: Work. This is what loads the 8 cells into the server side container, which is
+-- what Get then reads from. The game sends it whenever it displays a box.
+local function command_work(box)
+    local cells = read_cells(box);
+    if (cells == nil) then
         return;
     end
 
+    local filled = 0;
+    for postWorkNo = 0, CELL_COUNT - 1 do
+        local cell = cells[postWorkNo];
+        if (cell ~= nil and cell.itemid ~= 0) then
+            filled = filled + 1;
+            msg(fmt('  %d: %s x%d', to_slot_label(postWorkNo), item_name(cell.itemid), cell.stack));
+        end
+    end
+
+    msg(fmt('Loaded the %s cells: %d of %d hold something.', box_name(box), filled, CELL_COUNT));
+end
+
+local function command_list(box)
     local cells = read_cells(box);
     if (cells == nil) then
         return;
@@ -533,35 +601,13 @@ local function command_list(box)
     end
 end
 
+-- One packet: Get, with the BoxNo and PostWorkNo asked for. No open, no Work, no cell lookup.
+-- The server answers out of whatever it currently has loaded for this character.
 local function command_get(box, postWorkNo)
-    if (not open_box(box)) then
-        return;
-    end
-
-    local cells = read_cells(box);
-    if (cells == nil) then
-        return;
-    end
-
-    local cell = cells[postWorkNo];
-    if (cell == nil or cell.itemid == 0) then
-        err(fmt('Slot %d of the %s box is empty.', to_slot_label(postWorkNo), box_name(box)));
-        return;
-    end
-
-    if (cell.itemid ~= GIL_ITEM_ID and inventory_free() < 1) then
-        err('Your inventory is full.');
-        return;
-    end
-
-    take_cell(box, postWorkNo, cell);
+    take_cell(box, postWorkNo, nil);
 end
 
 local function command_all(box)
-    if (not open_box(box)) then
-        return;
-    end
-
     local cells = read_cells(box);
     if (cells == nil) then
         return;
@@ -606,10 +652,6 @@ end
 
 local function command_new()
     local box = BOXNO.Incoming;
-
-    if (not open_box(box)) then
-        return;
-    end
 
     local cells = read_cells(box);
     if (cells == nil) then
@@ -661,7 +703,6 @@ end
 
 local function command_close()
     send_pbx(COMMAND.PostClose, BOXNO.None, -1, -1, -1);
-    state.open = nil;
     msg('Sent PostClose.');
 end
 
@@ -713,6 +754,40 @@ ashita.events.register('command', 'dbox_command', function (e)
             config.send_mode = mode;
         end
         msg(fmt('Send mode: %s', config.send_mode));
+        return;
+    end
+
+    if (action == 'debug') then
+        if (#args > 2) then
+            config.debug = args[3]:lower():any('on', 'true', '1', 'yes');
+        else
+            config.debug = not config.debug;
+        end
+        msg(fmt('Debug: %s', config.debug and 'on' or 'off'));
+        return;
+    end
+
+    if (action == 'work') then
+        local box = to_box(args[3]);
+        if (box == nil) then
+            err('Box must be in or out.');
+            return;
+        end
+        run(function ()
+            command_work(box);
+        end);
+        return;
+    end
+
+    if (action == 'open') then
+        local box = to_box(args[3]);
+        if (box == nil or args[3] == nil) then
+            err('Say which box: /dbox open in, or /dbox open out.');
+            return;
+        end
+        run(function ()
+            open_box(box);
+        end);
         return;
     end
 

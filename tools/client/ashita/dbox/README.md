@@ -23,18 +23,38 @@ Then `/addon load dbox`, or add `/addon load dbox` to your Ashita script.
 
 ## Use
 
-Stand at a delivery NPC (a Mog House moogle, an auction house, a residential area) and open the
-delivery box window, then:
-
 ```
 /dbox get <slot> [in|out]   Take the item in <slot>. Box defaults to in.
 /dbox <slot> [in|out]       Shorthand for the above.
 /dbox all [in|out]          Take everything currently sitting in the 8 cells.
 /dbox list [in|out]         Print the contents of a box.
 /dbox new                   Pull waiting deliveries into the free incoming cells.
+/dbox work [in|out]         Send Work, loading that box's cells server side.
+/dbox open <in|out>         Send PostOpen or DeliOpen by hand.
 /dbox close                 Send PostClose, closing the box server side.
 /dbox mode [queue|inject]   Show or change how packets are sent.
+/dbox debug [on|off]        Print every 0x04D sent and every 0x04B received.
 /dbox help                  Print the command list.
+```
+
+The delivery box window does not need to be open. What the server actually requires, from
+`0x04d_pbx.cpp` and `dboxutils.cpp`, is:
+
+* An allowed zone: in a Mog House, or a zone carrying the `AuctionHouse` or `Mogmenu` misc flag,
+  or a GM character. Anywhere else and the packet is dropped with a warning in the map log.
+* Not in a cutscene or event, not crafting, not fishing, not jailed. The validator blocks those.
+* A box open server side, and for `Get`, cells loaded into that container. `PostOpen` or
+  `DeliOpen` opens it and clears the container, `Work` fills it. The game does both when it
+  displays a box, which is why `/dbox get` on its own works right after you have had the delivery
+  window up.
+
+Nothing is opened or realigned for you. If the server has nothing loaded, drive it yourself, one
+packet per command:
+
+```
+/dbox open in
+/dbox work in
+/dbox get 1 in
 ```
 
 `in` and `out` also accept `incoming`/`recv`/`1` and `outgoing`/`send`/`deli`/`2`.
@@ -53,10 +73,9 @@ in the first cell.
 Each command runs a short sequence and waits for the matching `GP_SERV_COMMAND_PBX_RESULT` (0x04B)
 reply before moving on, rather than firing packets on a timer:
 
-1. `PostOpen` (incoming) or `DeliOpen` (outgoing), skipped when the server already has that box
-   open. The addon tracks this from the replies, including replies caused by the game itself.
-2. `Work` for the box, which loads the 8 cells server side and tells the addon what is in them.
-3. `Get` for each requested slot.
+`/dbox get` sends one packet and nothing else. `list`, `all` and `work` send `Work` first, because
+that is what tells the addon which cells hold something. `open` and `close` send exactly the packet
+they name.
 
 `/dbox new` adds `Check`, to ask how many deliveries are queued behind the cells, then one `Recv`
 per free cell. `Recv` is the packet that moves a waiting delivery into an empty cell, so
@@ -69,18 +88,28 @@ not need an inventory slot for currency.
 
 * **The delivery box window must be open.** The server rejects 0x04D outside a zone that allows the
   delivery box, and every command except the open commands needs a box open server side.
-* **Asking for the other box moves the window.** The server keeps one open container per character.
-  If the window is showing the incoming box and you run `/dbox list out`, the addon sends
-  `DeliOpen` and `Work` for the outgoing box, and the client will follow along. That is the same
-  thing the game does when you switch tabs yourself, but it will look abrupt.
+* **One container per character.** The server holds one open box at a time. `Work` for the other
+  box repoints that container without changing what the client is displaying, and `Get` reads from
+  whatever is loaded, so keep track of which box you last loaded.
 * **Send mode.** `queue` (the default) hands the packet to the game's own packet queue, so the
   client stamps a valid sync value on it. This server drops any sub packet whose sync is not
   greater than the session's last one, see the parse loop in `src/map/map_networking.cpp`. `inject`
   writes the packet through Ashita directly. If commands appear to do nothing, and nothing turns up
   in the map server log, try `/dbox mode inject` and compare.
-* **Nothing happens on an empty cell.** The server stays silent when you `Get` an empty cell, so
-  the addon checks the cell contents from the `Work` reply first and tells you rather than waiting
-  out a timeout.
+* **Nothing happens on an empty cell.** The server stays silent when you `Get` a cell it has
+  nothing loaded for, so a bare `/dbox get` on an unloaded box just times out after 3 seconds.
+
+## When a command gets no reply
+
+`/dbox debug on` prints every 0x04D as it leaves the client and every 0x04B that comes back.
+
+* No outgoing line at all: the send path is the problem, try `/dbox mode inject`.
+* Outgoing line, no reply, and the map log says `DBOX: <name> is trying to use the delivery box in
+  a disallowed zone`: wrong zone.
+* Outgoing line, no reply, and the map log says `Invalid GP_CLI_COMMAND_PBX packet from <name>`:
+  the packet arrived and the validator rejected it; the message names the field.
+* Outgoing line, no reply, nothing in the map log at all: the packet never reached the handler.
+  That points at the sub packet sync check in `src/map/map_networking.cpp`.
 
 ## Tests
 
