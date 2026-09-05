@@ -91,11 +91,12 @@ not need an inventory slot for currency.
 * **One container per character.** The server holds one open box at a time. `Work` for the other
   box repoints that container without changing what the client is displaying, and `Get` reads from
   whatever is loaded, so keep track of which box you last loaded.
-* **Send mode.** `queue` (the default) hands the packet to the game's own packet queue, so the
-  client stamps a valid sync value on it. This server drops any sub packet whose sync is not
-  greater than the session's last one, see the parse loop in `src/map/map_networking.cpp`. `inject`
-  writes the packet through Ashita directly. If commands appear to do nothing, and nothing turns up
-  in the map server log, try `/dbox mode inject` and compare.
+* **Send mode.** `inject` is the default: `IPacketManager::AddOutgoingPacket`, the path most
+  addons use. `queue` uses the game's own queue instead,
+  `QueueOutgoingPacket(id, len, align, pparam1, pparam2, callback, args)`, which stamps the header
+  itself. That call returns a bool and was observed returning false on a live client, sending
+  nothing, which is why it is not the default. The addon checks the return value now, says so, and
+  falls back to injection for that send.
 * **Nothing happens on an empty cell.** The server stays silent when you `Get` a cell it has
   nothing loaded for, so a bare `/dbox get` on an unloaded box just times out after 3 seconds.
 
@@ -103,7 +104,8 @@ not need an inventory slot for currency.
 
 `/dbox debug on` prints every 0x04D as it leaves the client and every 0x04B that comes back.
 
-* No outgoing line at all: the send path is the problem, try `/dbox mode inject`.
+* No outgoing line at all: the packet never left the client. That is a send path problem, not a
+  server one. `inject` is the default for exactly this reason.
 * Outgoing line, no reply, and the map log says `DBOX: <name> is trying to use the delivery box in
   a disallowed zone`: wrong zone.
 * Outgoing line, no reply, and the map log says `Invalid GP_CLI_COMMAND_PBX packet from <name>`:

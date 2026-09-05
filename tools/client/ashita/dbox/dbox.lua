@@ -55,11 +55,11 @@ local config = T{
     slot_base = 1,
 
     -- How outgoing packets are sent.
-    --   'queue'  -> the game's own packet queue, so the client stamps a valid packet sync value.
-    --   'inject' -> raw injection through Ashita.
-    -- LandSandBoat drops any sub packet whose sync is not greater than the session's last one
-    -- (see src/map/map_networking.cpp), so 'queue' is the safer default.
-    send_mode = 'queue',
+    --   'inject' -> raw injection through Ashita's AddOutgoingPacket.
+    --   'queue'  -> the game's own packet queue (QueueOutgoingPacket), which stamps the header
+    --              itself. It returns false and sends nothing on some clients and builds, in
+    --              which case the addon says so and falls back to injection.
+    send_mode = 'inject',
 
     -- Seconds to wait for a 0x04B reply before giving up on a step.
     reply_timeout = 3.0,
@@ -330,21 +330,60 @@ local function build_pbx(command, boxNo, postWorkNo, itemWorkNo, itemStacks)
     return packet;
 end
 
-local function send_pbx(command, boxNo, postWorkNo, itemWorkNo, itemStacks)
-    local packet = build_pbx(command, boxNo, postWorkNo, itemWorkNo, itemStacks);
+-- Hands the packet to the game's own outgoing queue, which writes the header itself.
+-- IPacketManager::QueueOutgoingPacket(id, len, align, pparam1, pparam2, callback, args) returns
+-- false when the client refuses to queue it, and the Lua binding is not on every Ashita build,
+-- so both cases are reported rather than swallowed. Returns true only if the client took it.
+local function queue_send(packet)
+    local manager = AshitaCore:GetPacketManager();
+    local method  = manager.QueuePacket or manager.QueueOutgoingPacket;
 
-    if (config.send_mode == 'inject') then
-        AshitaCore:GetPacketManager():AddOutgoingPacket(PBX_C2S, packet);
-        return;
+    if (method == nil) then
+        err('This Ashita build has no packet queue binding. Using /dbox mode inject instead.');
+        config.send_mode = 'inject';
+        return false;
     end
 
-    -- The game's own queue writes the header, including a valid sync value.
-    AshitaCore:GetPacketManager():QueuePacket(PBX_C2S, 0x20, 0, 0, 0, function (ptr)
+    local success, queued = pcall(method, manager, PBX_C2S, 0x20, 0, 0, 0, function (ptr)
         local raw = ffi.cast('uint8_t*', ptr);
         for offset = 0x04, 0x1F do
             raw[offset] = packet[offset + 1];
         end
     end);
+
+    if (not success) then
+        err(fmt('The packet queue call failed: %s. Using /dbox mode inject instead.', queued));
+        config.send_mode = 'inject';
+        return false;
+    end
+
+    -- The binding returns the client's own bool. false means nothing was queued.
+    if (queued == false) then
+        err('The client refused to queue the packet. Using /dbox mode inject instead.');
+        config.send_mode = 'inject';
+        return false;
+    end
+
+    if (config.debug) then
+        msg('send 0x04D via the game packet queue');
+    end
+
+    return true;
+end
+
+local function send_pbx(command, boxNo, postWorkNo, itemWorkNo, itemStacks)
+    local packet = build_pbx(command, boxNo, postWorkNo, itemWorkNo, itemStacks);
+
+    if (config.send_mode == 'queue' and queue_send(packet)) then
+        return;
+    end
+
+    -- Raw injection. Ashita takes the table as the whole packet, header included.
+    AshitaCore:GetPacketManager():AddOutgoingPacket(PBX_C2S, packet);
+
+    if (config.debug) then
+        msg('send 0x04D via injection');
+    end
 end
 
 --[[

@@ -76,4 +76,26 @@ show('packets', packets());
 h.run('/dbox debug on');
 show('debug get 7 after Work', h.run('/dbox get 7 in'));
 h.run('/dbox debug off');
+-- Send paths: queue mode working, queue mode refused, and the binding missing entirely.
+S.boxes[1].cells[0] = { itemid = 4096, stack = 1, person = 'Sender1' };
+h.run('/dbox open in');
+h.run('/dbox work in');
+show('mode queue', h.run('/dbox mode queue'));
+show('get 1 via the game queue', h.run('/dbox get 1 in'));
+
+S.boxes[1].cells[1] = { itemid = 4097, stack = 1, person = 'Sender1' };
+h.run('/dbox work in');
+h.run('/dbox mode queue');
+S.queue_fails = true;
+show('get 2 when the client refuses to queue', h.run('/dbox get 2 in'));
+show('mode after the fallback', h.run('/dbox mode'));
+S.queue_fails = false;
+
+S.boxes[1].cells[2] = { itemid = 4098, stack = 1, person = 'Sender1' };
+h.run('/dbox work in');
+h.run('/dbox mode queue');
+h.drop_queue_binding();
+show('get 3 with no queue binding', h.run('/dbox get 3 in'));
+h.restore_queue_binding();
+
 h.realprint('DONE');

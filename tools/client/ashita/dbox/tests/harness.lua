@@ -185,14 +185,18 @@ local function handle(id, packet)
 end
 
 ------------------------------------------------------------------ core stubs
+local queue_binding_enabled = true;
 local inventory_used = 5;
 local inventory_max  = 30;
 
 AshitaCore = {
     GetPacketManager = function ()
-        return {
-            QueuePacket = function (_, id, size, a, b, c, cb)
+        local manager = {
+            QueuePacket = function (_, id, size, align, p1, p2, cb)
                 assert(size == 0x20, 'QueuePacket size');
+                assert(align == 0 and p1 == 0 and p2 == 0, 'QueuePacket align/pparams');
+                -- The client can refuse to queue; QueueOutgoingPacket returns false when it does.
+                if (server.queue_fails) then return false; end
                 local buf = setmetatable({}, {
                     __index = function () return 0; end,
                     __newindex = function (t, k, v) rawset(t, k, v); end,
@@ -202,9 +206,14 @@ AshitaCore = {
                 packet[0x01] = 0x4D; packet[0x02] = 0x10; packet[0x03] = 0; packet[0x04] = 0;
                 for offset = 0x04, 0x1F do packet[offset + 1] = rawget(buf, offset) or 0; end
                 handle(id, packet);
+                return true;
             end,
             AddOutgoingPacket = function (_, id, packet) handle(id, packet); end,
         };
+        if (not queue_binding_enabled) then
+            manager.QueuePacket = nil;
+        end
+        return manager;
     end,
     GetMemoryManager = function ()
         return {
@@ -267,6 +276,9 @@ end
 
 return {
     server = server,
+    drop_queue_binding    = function () queue_binding_enabled = false; end,
+    restore_queue_binding = function () queue_binding_enabled = true; end,
+    queue_binding_enabled = function () return queue_binding_enabled; end,
     run = run_command,
     realprint = realprint,
     set_inventory = function (used, max) inventory_used = used; inventory_max = max; end,
