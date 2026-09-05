@@ -37,6 +37,13 @@ This tool is used to distribute the following items:
 
 Sends `<your message>` to every character, in every zone, on every map process.  
 
+## Delivery Box Addon (client side)
+`tools/client/ashita/dbox`
+
+An Ashita v4 addon that retrieves items from either delivery box, incoming or outgoing, by slot
+number from a chat command. See the README in that folder for install and usage. It is a client
+tool, so it is not loaded or used by the server.
+
 Setup
 ========================
 
